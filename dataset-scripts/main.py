@@ -12,14 +12,17 @@ import numpy as np
 import yt_dlp
 from yt_dlp import DownloadError, SameFileError
 
+def get_or_default(arr, i, default):
+	return arr[i] if i < len(arr) else default
+
 # File with column 'videoID'
-INPUT_FILENAME = 'sponsorVideoIDs_1646386033207.csv'
+INPUT_FILENAME = get_or_default(sys.argv, 1, 'sponsorVideoIDs.csv')
 # File to use to save job state
-STATUS_FILENAME = 'status.csv'
+STATUS_FILENAME = get_or_default(sys.argv, 2, 'status.csv')
 # Directory to store downloaded captions in
-OUTPUT_PATH = 'sponsor'
+OUTPUT_PATH = get_or_default(sys.argv, 3, 'sponsor')
 # Number of concurrent yt-dlp scripts to run
-NUM_THREADS = 32
+NUM_THREADS = int(get_or_default(sys.argv, 4, '32'))
 
 # Runtime stats to display progress
 processed = 0
