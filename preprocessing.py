@@ -4,6 +4,8 @@ from typing import List, Tuple
 import pandas as pd
 from enum import Enum
 
+import webvtt # webvtt-py
+
 class Caption:
 	def __init__(self, start: int, end: int, text: str):
 		self.start = start
@@ -39,37 +41,7 @@ class OverlappingSegmentGroup:
 		self.votes = 0
 
 def get_caption_list_from_path(path: str) -> list[Caption]:
-	captions = []
-	with open(path, encoding='utf-8') as f:
-		lines = f.readlines()
-
-		# remove double \n then remove \n
-		lines = "".join(lines).replace('\n\n\n', '\n\n').split('\n')
-
-		# where to split
-		# first section is header and last one is an extra linebreak
-		breakpoints = [i for i, line in enumerate(lines) if line == ''][1:-1]
-
-		start = breakpoints[0] + 1
-		for end in breakpoints[1:]:
-			# Skip optional sequence numbers in vtt files
-			if lines[start].isdecimal():
-				start += 1
-			timestamps_text, text = lines[start], " ".join(lines[start+1:end])
-			text = clean_text(text)
-			timestamps = timestamps_text.split(' ')
-			try:
-				timestamps = [timestamps[0], timestamps[2]]
-			except IndexError as e:
-				e.args = (*e.args, f'while parsing "{timestamps_text}"')
-				raise e
-
-			start_time, end_time = [_get_timestamp_in_seconds(ts) for ts in timestamps]
-
-			captions.append(Caption(start_time, end_time, text))
-			start = end + 1
-
-	return captions
+	return list(webvtt.read(path))
 
 def _get_timestamp_in_seconds(timestamp: str) -> float:
 	h, m, s = [float(x) for x in timestamp.split(':')]
