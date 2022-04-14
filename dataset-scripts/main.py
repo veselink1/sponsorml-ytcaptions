@@ -157,7 +157,8 @@ def _print_progress():
             {(gold / processed * 100):.2f}% of videos have GOLD captions, {(silver / processed * 100):.2f}% of videos have SILVER captions
             {((processed + processed_last_session) / len(video_ids) * 100):.2f}% done""")
         with lock:
-            results.to_csv(STATUS_FILENAME, index=False)
+            results.to_csv(STATUS_FILENAME + '~', index=False)
+            os.replace(STATUS_FILENAME + '~', STATUS_FILENAME)
         time.sleep(5)
 
 timer = threading.Thread(target=_print_progress)
