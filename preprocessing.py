@@ -52,6 +52,9 @@ def get_caption_list_from_path(path: str) -> list[Caption]:
 
 		start = breakpoints[0] + 1
 		for end in breakpoints[1:]:
+			# Skip optional sequence numbers in vtt files
+			if lines[start].isdecimal():
+				start += 1
 			timestamps_text, text = lines[start], " ".join(lines[start+1:end])
 			text = clean_text(text)
 			timestamps = timestamps_text.split(' ')
