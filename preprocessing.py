@@ -40,7 +40,7 @@ class OverlappingSegmentGroup:
 		self.segments: List[DBSegment] = []
 		self.votes = 0
 
-def get_caption_list_from_path(path: str) -> list[Caption]:
+def get_caption_list_from_path(path: str):
 	return list(webvtt.read(path))
 
 def _get_timestamp_in_seconds(timestamp: str) -> float:
@@ -51,10 +51,10 @@ def _get_timestamp_in_seconds(timestamp: str) -> float:
 def get_intersection_range(captions: list[Caption], start: float, end: float, error: float = 0.2) -> Tuple[float, float]:
 	segment_range = [0, 0]
 	for i in range(len(captions)):
-		if (captions[i].start + error) >= start:
+		if (captions[i]._start + error) >= start:
 			segment_range[0] = i
 			for j in range(i, len(captions)):
-				if (captions[j].start - error) >= end:
+				if (captions[j]._start - error) >= end:
 					segment_range[1] = j
 					break
 			break
