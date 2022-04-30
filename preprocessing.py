@@ -1,8 +1,6 @@
-from asyncore import write
-import chunk
 import os
 import sys
-from typing import List, Tuple
+from typing import Iterator, List, Tuple
 import pandas as pd
 from enum import Enum
 import gzip
@@ -16,7 +14,7 @@ class Caption:
 		self.text = text
 
 	def __repr__(self):
-		return self.text
+		return f'Caption{{{self.start},{self.end},{self.text}}}'
 
 class DBSegment:
 	category: str
@@ -44,26 +42,80 @@ class OverlappingSegmentGroup:
 		self.votes = 0
 
 def get_caption_list_from_path(path: str):
-	return list(webvtt.read(path))
+	cap_iter: Iterator[webvtt.Caption] = webvtt.read(path)
+	# The cap_iter may contain overlapping caption regions like below:
+	#	<Caption start=00:00:00.060 end=00:00:01.730 text= \nyou know working with tech all the time>
+	#	<Caption start=00:00:01.730 end=00:00:01.740 text=you know working with tech all the time\n >
+	#	<Caption start=00:00:01.740 end=00:00:03.470 text=you know working with tech all the time\nI sometimes forget that not everyone>
+	#	<Caption start=00:00:03.470 end=00:00:03.480 text=I sometimes forget that not everyone\n >
+	#	<Caption start=00:00:03.480 end=00:00:05.059 text=I sometimes forget that not everyone\nknows about even the most basic of>
+	#	<Caption start=00:00:05.059 end=00:00:05.069 text=knows about even the most basic of\n >
+	#	<Caption start=00:00:05.069 end=00:00:07.579 text=knows about even the most basic of\nthings example well the various>
+	#	<Caption start=00:00:07.579 end=00:00:07.589 text=things example well the various\n >
+	#	<Caption start=00:00:07.589 end=00:00:10.070 text=things example well the various\nstandards of network cables cat 5 versus>
+	#	<Caption start=00:00:10.070 end=00:00:10.080 text=standards of network cables cat 5 versus\n >
+	# This is how auto-generated captions follow a person's speech.
+	# cap[1] replaces cap[0] on-screen and creates a sliding effect.
+	# This is fine for YT but not for us.
+
+	# To fix remove the duplication, we check for overlapping parts of text
+	# between the captions and eliminate them.
+	output: List[Caption] = []
+	prev_cap = Caption(start=0, end=0, text="")
+	for cap in cap_iter:
+		cap = Caption(cap.start_in_seconds, cap.end_in_seconds, cap.text)
+		cap.text = cap.text.strip()
+
+		ilen = get_intersection_length(prev_cap.text, cap.text)
+		# Is the overlap a whole token or more?
+		if ilen >= len(cap.text.split(' ', 1)[0]):
+			if len(cap.text) == ilen:
+				# Remove the whole caption altogether, it is duplicated
+				continue
+			else:
+				# Remove the overlap from this caption
+				cap.text = cap.text[ilen:]
+
+		output.append(cap)
+		prev_cap = cap
+
+	return output
+
+def get_intersection_length(left: str, right: str):
+	"""
+	Finds how many characters of overlap is there between left and right.
+
+	```
+	left  = "except the various"
+	right =            "various forms"
+	                    ^^^^^^^
+	```
+	"""
+	i = 0
+	while not right.startswith(left[i:]):
+		i += 1
+	ilen = len(left) - i
+	assert ilen == 0 or left[-ilen:] == right[:ilen]
+	return ilen
 
 def _get_timestamp_in_seconds(timestamp: str) -> float:
 	h, m, s = [float(x) for x in timestamp.split(':')]
 	return (h * 3600) + (m * 60) + s
 
 # allow an error margin for the caption to be considered part of the segment
-def get_intersection_range(captions: list[Caption], start: float, end: float, error: float = 0.2) -> Tuple[float, float]:
+def get_intersection_range(captions: List[Caption], start: float, end: float, error: float = 0.2) -> Tuple[float, float]:
 	segment_range = [0, 0]
 	for i in range(len(captions)):
-		if (captions[i]._start + error) >= start:
+		if (captions[i].start + error) >= start:
 			segment_range[0] = i
 			for j in range(i, len(captions)):
-				if (captions[j]._start - error) >= end:
+				if (captions[j].start - error) >= end:
 					segment_range[1] = j
 					break
 			break
 	return tuple(segment_range)
 
-def tokenize(text: str) -> list[str]:
+def tokenize(text: str) -> List[str]:
 	# basic tokenization
 	return text.split(' ')
 
