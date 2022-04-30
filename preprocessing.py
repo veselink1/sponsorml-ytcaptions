@@ -1,8 +1,11 @@
+from asyncore import write
+import chunk
 import os
 import sys
 from typing import List, Tuple
 import pandas as pd
 from enum import Enum
+import gzip
 
 import webvtt # webvtt-py
 
@@ -108,11 +111,22 @@ def get_best_segment(group: OverlappingSegmentGroup):
 
 	return max(group.segments, key=lambda segment: segment.votes)
 
-def prepare_data(captions_path: str, sponsorml_path: str, output_path: str, vote_threshold: int):
+def prepare_data(captions_path: str, sponsorml_path: str, output_path: str, vote_threshold: int, chunk_size: int):
 	filenames = os.listdir(captions_path)
 	print('Reading database...')
 	sponsorml_df = pd.read_csv(sponsorml_path)
 	rows = []
+
+	chunk_id = 0
+	def write_chunk():
+		nonlocal chunk_id
+		nonlocal rows
+		chunk_id += 1
+		df = pd.DataFrame(rows, columns=['videoID', 'transcript', 'sponsorText', 'sponsorTokenRange'])
+		filename, ext = output_path.rsplit('.', 1)
+		with gzip.open(f'{filename}.{chunk_id}.{ext}.gz', 'wb') as f:
+			df.to_csv(f)
+		rows = []
 
 	print('Processing captions...')
 	for i, filename in enumerate(filenames):
@@ -157,8 +171,11 @@ def prepare_data(captions_path: str, sponsorml_path: str, output_path: str, vote
 
 			rows.append((videoID, full_transcript, sponsor_text, (token_start, token_end)))
 
-	df = pd.DataFrame(rows, columns=['videoID', 'transcript', 'sponsorText', 'sponsorTokenRange'])
-	df.to_csv(output_path)
+			if len(rows) > chunk_size:
+				write_chunk()
+
+	if len(rows) > 0:
+		write_chunk()
 
 def get_or_default(arr, i, default):
 	return arr[i] if i < len(arr) else default
@@ -167,9 +184,10 @@ CAPTIONS_PATH = get_or_default(sys.argv, 1, 'captions')
 SPONSORML_PATH = get_or_default(sys.argv, 2, 'sponsorTimes.csv')
 OUTPUT_PATH = get_or_default(sys.argv, 3, 'data.csv')
 VOTE_THRESHOLD = -1 # Same threshold SponsorBlock is using
+CHUNK_SIZE = 10000
 
 def main():
-	prepare_data(CAPTIONS_PATH, SPONSORML_PATH, OUTPUT_PATH, VOTE_THRESHOLD)
+	prepare_data(CAPTIONS_PATH, SPONSORML_PATH, OUTPUT_PATH, VOTE_THRESHOLD, CHUNK_SIZE)
 
 if __name__ == '__main__':
 	main()
