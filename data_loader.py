@@ -44,9 +44,9 @@ def get_intersection_range(captions: List[dict], start: float, end: float, error
     return start_caption, end_caption
 
 
-class GzippedCSVDataset(torch.utils.data.IterableDataset):
+class GzippedJSONDataset(torch.utils.data.IterableDataset):
     """
-    Reads a .csv.gz file.
+    Reads a .json.gz file.
     """
     def __init__(self, path: str):
         super().__init__()
@@ -99,4 +99,4 @@ def load_captions_from_chunks(base_name: str, root_dir: str = '.', chunks: Optio
             raise FileNotFoundError(file)
         info(f'Found {file}.')
 
-    return torch.utils.data.ChainDataset([GzippedCSVDataset(file) for file in files])
+    return torch.utils.data.ChainDataset([GzippedJSONDataset(file) for file in files])
