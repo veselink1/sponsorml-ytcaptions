@@ -1,10 +1,11 @@
 import os
 import sys
-from typing import Iterator, List, Tuple
-import pandas as pd
+from time import time
+from typing import Iterator, List, Optional, Tuple
 from enum import Enum
-import gzip
+from datetime import timedelta
 
+import pandas as pd
 import webvtt # webvtt-py
 
 class Caption:
@@ -12,9 +13,11 @@ class Caption:
 		self.start = start
 		self.end = end
 		self.text = text
+		# self.is_sponsor = False
 
 	def __repr__(self):
-		return f'Caption{{{self.start},{self.end},{self.text}}}'
+		text = self.text.replace('\n', '\\n')
+		return f'Caption{{{self.start}:{self.end},{text}}}'
 
 class DBSegment:
 	category: str
@@ -66,6 +69,9 @@ def get_caption_list_from_path(path: str):
 		cap = Caption(cap.start_in_seconds, cap.end_in_seconds, cap.text)
 		cap.text = cap.text.strip()
 
+		if cap.text == '':
+			continue
+
 		ilen = get_intersection_length(prev_cap.text, cap.text)
 		# Is the overlap a whole token or more?
 		if ilen >= len(cap.text.split(' ', 1)[0]):
@@ -73,8 +79,8 @@ def get_caption_list_from_path(path: str):
 				# Remove the whole caption altogether, it is duplicated
 				continue
 			else:
-				# Remove the overlap from this caption
-				cap.text = cap.text[ilen:]
+				# Remove the overlap from the previous caption
+				prev_cap.text = prev_cap.text[:-ilen]
 
 		output.append(cap)
 		prev_cap = cap
@@ -97,23 +103,6 @@ def get_intersection_length(left: str, right: str):
 	ilen = len(left) - i
 	assert ilen == 0 or left[-ilen:] == right[:ilen]
 	return ilen
-
-def _get_timestamp_in_seconds(timestamp: str) -> float:
-	h, m, s = [float(x) for x in timestamp.split(':')]
-	return (h * 3600) + (m * 60) + s
-
-# allow an error margin for the caption to be considered part of the segment
-def get_intersection_range(captions: List[Caption], start: float, end: float, error: float = 0.2) -> Tuple[float, float]:
-	segment_range = [0, 0]
-	for i in range(len(captions)):
-		if (captions[i].start + error) >= start:
-			segment_range[0] = i
-			for j in range(i, len(captions)):
-				if (captions[j].start - error) >= end:
-					segment_range[1] = j
-					break
-			break
-	return tuple(segment_range)
 
 def tokenize(text: str) -> List[str]:
 	# basic tokenization
@@ -169,24 +158,37 @@ def prepare_data(captions_path: str, sponsorml_path: str, output_path: str, vote
 	sponsorml_df = pd.read_csv(sponsorml_path)
 	rows = []
 
+	start_time = time()
+
 	chunk_id = 0
 	def write_chunk():
 		nonlocal chunk_id
 		nonlocal rows
 		chunk_id += 1
-		df = pd.DataFrame(rows, columns=['videoID', 'transcript', 'sponsorText', 'sponsorTokenRange'])
-		filename, ext = output_path.rsplit('.', 1)
-		with gzip.open(f'{filename}.{chunk_id}.{ext}.gz', 'wb') as f:
-			df.to_csv(f)
+		df = pd.DataFrame(rows, columns=['videoID', 'captions', 'sponsor_times'])
+		filename, ext = output_path.rsplit('.json', 1)
+		chunk_filename = f'{filename}.{chunk_id}.json{ext}'
+		df.to_json(chunk_filename, orient='records', compression='infer')
 		rows = []
+
+	# This is much much faster than doing sponsorml_df[sponsorml_df.videoID == videoID]
+	# later. (cut down running time from 12h to 3h)
+	grouped_df = sponsorml_df.groupby(by=["videoID"])
 
 	print('Processing captions...')
 	for i, filename in enumerate(filenames):
 		progress = (i + 1) / len(filenames) * 100
-		print(f'\r{progress:.2f}%', end='', flush=True)
+		elapsed = time() - start_time
+		remaining = (100 - progress) * elapsed / progress
+		print('\u001b[2K\r', end='')
+		print(f'{progress:.2f}% ' +
+			f'elapsed: {timedelta(seconds=int(elapsed))}, ' +
+			f'remaining: {timedelta(seconds=int(remaining))}',
+			end='', flush=True)
 		videoID = filename.split('.')[0]
 		# get all labeled segments of video
-		segments = sponsorml_df[sponsorml_df.videoID == videoID]
+
+		segments = grouped_df.get_group(videoID)
 
 		if len(segments) == 0:
 			print(f'No segments for {videoID}!')
@@ -198,33 +200,18 @@ def prepare_data(captions_path: str, sponsorml_path: str, output_path: str, vote
 		# Filter out similar segments
 		segments = [get_best_segment(group) for group in build_segment_groups(segments)]
 
-		for segment in segments:
-			try:
-				captions = get_caption_list_from_path(f'{captions_path}/{filename}')
-			except Exception as e:
-				e.args = (*e.args, f'while processing {filename}')
-				raise e
+		try:
+			captions = get_caption_list_from_path(f'{captions_path}/{filename}')
+		except Exception as e:
+			e.args = (*e.args, f'while processing {filename}')
+			raise e
 
-			# extract transcript
-			full_transcript = " ".join([caption.text for caption in captions])
+		segment_times = [(segment.startTime, segment.endTime) for segment in segments]
 
-			# get intersection range and extract the sponsor text from it
-			start_index, end_index = get_intersection_range(captions, segment.startTime, segment.endTime)
-			sponsor_text = " ".join([caption.text for caption in captions[start_index:end_index]])
+		rows.append((videoID, captions, segment_times))
 
-			# get the indicies of the first token and last token in the segment
-			token_start = 0
-			for i in range(start_index):
-				token_start += len(tokenize(captions[i].text))
-
-			token_end = token_start + 1
-			for i in range(start_index, end_index):
-				token_end += len(tokenize(captions[i].text))
-
-			rows.append((videoID, full_transcript, sponsor_text, (token_start, token_end)))
-
-			if len(rows) > chunk_size:
-				write_chunk()
+		if len(rows) > chunk_size:
+			write_chunk()
 
 	if len(rows) > 0:
 		write_chunk()
@@ -234,9 +221,9 @@ def get_or_default(arr, i, default):
 
 CAPTIONS_PATH = get_or_default(sys.argv, 1, 'captions')
 SPONSORML_PATH = get_or_default(sys.argv, 2, 'sponsorTimes.csv')
-OUTPUT_PATH = get_or_default(sys.argv, 3, 'data.csv')
+OUTPUT_PATH = get_or_default(sys.argv, 3, 'data.json.gz')
 VOTE_THRESHOLD = -1 # Same threshold SponsorBlock is using
-CHUNK_SIZE = 10000
+CHUNK_SIZE = 10_000
 
 def main():
 	prepare_data(CAPTIONS_PATH, SPONSORML_PATH, OUTPUT_PATH, VOTE_THRESHOLD, CHUNK_SIZE)
