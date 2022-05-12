@@ -255,7 +255,7 @@ class GzippedJSONDataset(torch.utils.data.IterableDataset):
 
 	def __iter__(self) -> Generator[(str, List[dict], List[Tuple[int, int]])]:
 		info(f'Opening {self.path} for reading...')
-		with pd.read_json('./data.1.json.gz', orient='record', lines=True, compression='infer', chunksize=500) as reader:
+		with pd.read_json(self.path, orient='record', lines=True, compression='infer', chunksize=500) as reader:
 			for chunk in reader:
 				for video_id, captions, sponsor_times in chunk.itertuples(index=False, name=None):
 					# Convert from tuples to dicts
