@@ -1,96 +1,127 @@
 from typing import Generator, Iterable, List, Optional, Tuple
 from glob import glob
 import os
-import gzip
 import random
 
-from numpy import isin
 import pandas as pd
 import torch
 
 from log import info, warn
 
-class Caption(dict):
-    def __init__(self, start: float, end: float, text: str):
-        self['text'] = text
-        self['start'] = start
-        self['end'] = end
-
-    @property
-    def text(self):
-        return self['text']
-
-    @text.setter
-    def text(self, value):
-        self['text'] = value
-
-    @property
-    def start(self):
-        return self['start']
-
-    @start.setter
-    def start(self, value):
-        self['start'] = value
-
-    @property
-    def end(self):
-        return self['end']
-
-    @end.setter
-    def end(self, value):
-        self['end'] = value
-
-
-def parse_int_tuple(s):
-    return tuple(map(int, s.replace('(','').replace(')','').split(',')))
-
-# allow an error margin for the caption to be considered part of the segment
-def get_intersection_range(captions: List[dict], start: float, end: float, error: float = 1) -> Tuple[int, int]:
-    start_caption = None
-    for i in range(len(captions)):
-        if captions[i]['start'] >= start:
-            start_caption = i
-            break
-
-    if start_caption is None:
-        return None, None
-
-    if start_caption + 1 < len(captions):
-        if captions[start_caption + 1]['start'] - start < error:
-            start_caption += 1
-
-    end_caption = None
-    for i in range(start_caption, len(captions)):
-        if captions[i]['start'] >= end:
-            end_caption = i
-            break
-
-    if end_caption is None:
-        return None, None
-
-    if end_caption - 1 >= 0:
-        if captions[end_caption - 1]['end'] - end < error:
-            end_caption = max(start_caption, end_caption - 1)
-
-    assert start_caption <= end_caption
-    return start_caption, end_caption
-
-
-# captions are often coded to stay on screen until the next caption line comes
+# Captions are often coded to stay on screen until the next caption line comes
 # but that is not ideal -- so we limit how much it is reasonable for a word
-# to stay on screen. Source: https://debatrix.com/en/tools/speech-calculator/#:~:text=How%20many%20words%20per%20minute,will%20use%20around%20110%20words.
-# For slow english speakers, each words takes about 0.54 seconds to pronounce.
+# to stay on screen. The issue with leaving captions on for longer is that in some
+# edge cases, the captions are incorrectly left unchanged throughout a sponsored
+# segment (the sponsored segment is not transcribed) and when it comes to
+# labelling the captions as part of our process to construct a training dataset,
+# these "left-over" captions from before the sponsored segment starts are the
+# the only text coded to be on-screen during the sponsored segment.
+# I.e. this is done to aim in data cleaning.
+#
+# For slow English speakers, each words takes about 0.54 seconds to pronounce.
+# We are limit each token to 1 second.
+# Source: https://debatrix.com/en/tools/speech-calculator/#:~:text=How%20many%20words%20per%20minute,will%20use%20around%20110%20words.
 MAX_DURATION_PER_TOKEN = 1
-CAPTION_TIME_WINDOW = 5
-SPONSOR_BEGIN_CLASS = 'sponsor_begin'
-SPONSOR_END_CLASS = 'sponsor_end'
-NON_SPONSOR_CLASS = 'not_sponsor'
+
+# Classes for the sequence classification model
+SPONSOR_CLASS = 'sponsor'
+CONTENT_CLASS = 'content'
+
+class Caption(dict):
+	"""
+	A caption line with start and end time in seconds.
+	"""
+	def __init__(self, start: float, end: float, text: str):
+		self['text'] = text
+		self['start'] = start
+		self['end'] = end
+
+	@property
+	def text(self):
+		return self['text']
+
+	@text.setter
+	def text(self, value):
+		self['text'] = value
+
+	@property
+	def start(self):
+		return self['start']
+
+	@start.setter
+	def start(self, value):
+		self['start'] = value
+
+	@property
+	def end(self):
+		return self['end']
+
+	@end.setter
+	def end(self, value):
+		self['end'] = value
+
+def get_intersection_range(captions: List[dict], start: float, end: float, error: float = 1) -> Tuple[int, int]:
+	"""
+	Intersects the list of captions with the start and end times of a segment expressed
+	in seconds. Allows for an error margin for captions to be considered part of the segment.
+	The error margin is also in seconds.
+
+	Returns `(None, None)` if no such sub-list exists.
+	"""
+	start_caption = None
+	for i in range(len(captions)):
+		if captions[i]['start'] >= start:
+			start_caption = i
+			break
+
+	if start_caption is None:
+		return None, None
+
+	# Apply the error margin
+	if start_caption + 1 < len(captions):
+		# If the second caption starts very close to the start of the segment,
+		# skip over the first caption that was picked originally; it is likely
+		# non related to the sponsored content.
+		if captions[start_caption + 1]['start'] - start < error:
+			start_caption += 1
+
+	end_caption = None
+	for i in range(start_caption, len(captions)):
+		if captions[i]['start'] >= end:
+			end_caption = i
+			break
+
+	if end_caption is None:
+		return None, None
+
+	# Apply the error margin
+	if end_caption - 1 >= 0:
+		# If the second to last caption ends very close to the end of the
+		# segment, skip over the last caption that was picked originally.
+		# It is likely non related to the sponsored content.
+		if captions[end_caption - 1]['end'] - end < error:
+			end_caption = max(start_caption, end_caption - 1)
+
+	assert start_caption <= end_caption
+	return start_caption, end_caption
 
 def tokenize(text: str) -> List[str]:
-	# basic tokenization
+	"""
+	Tokenizes the string.
+	"""
+	# Split by unicode whitespace.
 	return text.split()
 
 def tokenize_caption_list(captions: Iterable[Caption]):
+	"""
+	Tokenizes the list of captions by splitting captions with multiple tokens
+	into separate `Caption` objects. The duration for each token is approximated
+	from the duration of the original caption and the length of the work in characters.
+	This allows for more accurate token-level extraction to be done.
+
+	Input: 0:0:0 Hello World 0:0:2
+	Output: 0:0:0 Hello 0:0:1 World 0:0:2
+	"""
 	for caption in captions:
 		text = caption.text
 		tokens = tokenize(text)
@@ -100,8 +131,8 @@ def tokenize_caption_list(captions: Iterable[Caption]):
 			yield Caption(caption.start, caption.end, tokens[0])
 			continue
 
-		# assume every character is pronounced and
-		# characters and word separators take the same amount of time
+		# Heuristic: Assume the time necessary to pronouce each word depends
+		# on the number of characters in that word.
 		total_chars = sum(len(token) + 1 for token in tokens)
 		time_per_char = (caption.end - caption.start) / total_chars
 
@@ -111,7 +142,26 @@ def tokenize_caption_list(captions: Iterable[Caption]):
 			yield Caption(current_timestamp, current_timestamp + time_per_char * len(token), token)
 			current_timestamp += token_duration + time_per_char
 
+def segment_duration(captions: List[Caption]):
+	"""
+	Returns the duration of the segment in seconds.
+	"""
+	if len(captions) < 1:
+		return 0
+	return captions[-1].end - captions[0].start
+
+def segment_text(captions: List[Caption]):
+	"""
+	Returns the text in the segment.
+	"""
+	return ' '.join((caption.text for caption in captions))
+
 def forward_time_window(captions: List[Caption], start_index: int, duration: int):
+	"""
+	Seeks forward for `duration` seconds starting at the start time of the
+	caption with index `start_index` the captions are fully contained within
+	that time interval.
+	"""
 	results = [captions[start_index]]
 	start_time = captions[start_index].start
 	index = start_index + 1
@@ -122,6 +172,11 @@ def forward_time_window(captions: List[Caption], start_index: int, duration: int
 	return results
 
 def backward_time_window(captions: List[Caption], end_index: int, duration: int):
+	"""
+	Seeks backward for `duration` seconds ending at the start time of the caption
+	with index `end_index` and returns the captions are fully contained within
+	that time interval.
+	"""
 	results = [captions[end_index]]
 	end_time = captions[end_index].end
 	index = end_index - 1
@@ -131,178 +186,187 @@ def backward_time_window(captions: List[Caption], end_index: int, duration: int)
 
 	return results
 
-def segment_duration(captions: List[Caption]):
-	if len(captions) < 1:
-		return 0
-	return captions[-1].end - captions[0].start
-
-def segment_text(captions: List[Caption]):
-	return ' '.join((caption.text for caption in captions))
-
 def extract_labelled_data(video_id, captions, sponsor_ranges):
+	"""
+	Extracts labelled examples suitable for the training of a binary
+	sequence classification model.
+
+	For each video 2*N examples are generated, where N is the number of sponsored
+	segments in the video.
+
+	The text of each sponsored segment is matched to other random text in the video
+	occuring in a similar time frame (if the sponsored segment is 10s,
+	the non-sponsored segment extracted is also 10s).
+	"""
 	sponsor_segments = []
-	non_sponsor_segments = []
+	content_segments = []
+
+	# Segment the whole video into sponsored and content segments.
 	last_sponsor_segment_end = -1
 	for start, end in sponsor_ranges:
 		sponsor_segments.append(captions[start:end])
-		non_sponsor_segments.append(captions[last_sponsor_segment_end + 1:start])
+		content_segments.append(captions[last_sponsor_segment_end + 1:start])
 		last_sponsor_segment_end = end
 
-	non_sponsor_segments.append(captions[last_sponsor_segment_end + 1:])
+	# Don't forget the last segment (could be empty, but we check for that later).
+	content_segments.append(captions[last_sponsor_segment_end + 1:])
 
-	# Sort by segment length
-	random.shuffle(sponsor_segments)
-	random.shuffle(non_sponsor_segments)
+	# Shuffle the content segments before matching sponsor segments to them
+	random.shuffle(content_segments)
 
 	for sponsor_segment in sponsor_segments:
-		if segment_duration(sponsor_segment) < CAPTION_TIME_WINDOW * 2:
-			print(f'Skipping short sponsor segment: {segment_duration(sponsor_segment)}s')
+		if len(sponsor_segment) == 0:
 			continue
 
-		sponsor_begin_segment = forward_time_window(sponsor_segment, 0, CAPTION_TIME_WINDOW)
-		sponsor_end_segment = backward_time_window(sponsor_segment, len(sponsor_segment) - 1, CAPTION_TIME_WINDOW)
+		sponsor_duration = segment_duration(sponsor_segment)
 
-		if len(sponsor_begin_segment) * MAX_DURATION_PER_TOKEN < CAPTION_TIME_WINDOW:
-			print(f'Skipping sponsor segment with weird captioning: {sponsor_begin_segment}')
-			continue
-		if len(sponsor_end_segment) * MAX_DURATION_PER_TOKEN < CAPTION_TIME_WINDOW:
-			print(f'Skipping sponsor segment with weird captioning: {sponsor_end_segment}')
-
-		sponsor_begin_text = segment_text(sponsor_begin_segment)
-		sponsor_end_text = segment_text(sponsor_end_segment)
-
-		if sponsor_begin_text == sponsor_end_text:
-			print('Skipping sponsor segment with broken captions')
-			continue
-
-		# Match to a non-sponsor segment with the length
+		# Match to a non-sponsor segment with the same duration
 		found_match = False
 
-		for non_sponsor_segment in non_sponsor_segments:
-			if segment_duration(non_sponsor_segment) <= CAPTION_TIME_WINDOW * 3:
+		for content_segment in content_segments:
+			if segment_duration(content_segment) < sponsor_duration:
 				continue
 
-			# Remove from list so we don't pick it again
-			non_sponsor_segments.remove(non_sponsor_segment)
+			# Sample either the first N or last N seconds of the segment
+			if bool(random.getrandbits(1)):
+				short_content_segment = forward_time_window(content_segment, 0, sponsor_duration)
+			else:
+				short_content_segment = backward_time_window(content_segment, len(content_segment) - 1, sponsor_duration)
 
-			mid_point = len(forward_time_window(non_sponsor_segment, 0, CAPTION_TIME_WINDOW))
-			if mid_point >= len(non_sponsor_segment):
-				# Skip
-				continue
-
-			short_non_sponsor_segment = forward_time_window(non_sponsor_segment, mid_point, CAPTION_TIME_WINDOW)
-			non_sponsor_text = segment_text(short_non_sponsor_segment)
-
-			# Yield the three segments
-			yield sponsor_begin_text, SPONSOR_BEGIN_CLASS
-			yield sponsor_end_text, SPONSOR_END_CLASS
-			yield non_sponsor_text, NON_SPONSOR_CLASS
+			# Yield the two segments
+			yield segment_text(sponsor_segment), SPONSOR_CLASS
+			yield segment_text(short_content_segment), CONTENT_CLASS
 
 			# Process the next pair
 			found_match = True
 			break
 
 		if not found_match:
-			print(f'Could not find a non-sponsored segment with the same length as the sponsored segment for {video_id}')
+			warn(f'Could not find a non-sponsored segment with the same duration as the sponsored segment for {video_id}')
 
 
 class GzippedJSONDataset(torch.utils.data.IterableDataset):
-    """
-    Reads a .json.gz file.
-    """
-    def __init__(self, path: str):
-        super().__init__()
-        self.path = path
+	"""
+	Reads a .json.gz file.
+	"""
+	def __init__(self, path: str):
+		super().__init__()
+		self.path = path
 
-    def __iter__(self) -> Generator[(str, List[dict], List[Tuple[int, int]])]:
-        info(f'Opening {self.path} for reading...')
-        with pd.read_json('./data.1.json.gz', orient='record', lines=True, compression='infer', chunksize=500) as reader:
-            for chunk in reader:
-                for video_id, captions, sponsor_times in chunk.itertuples(index=False, name=None):
-                    # Convert from tuples to dicts
-                    captions = [Caption(start, end, text) for (text, start, end) in captions]
-                    yield video_id, captions, sponsor_times
-        info(f'Closed {self.path}.')
+	def __iter__(self) -> Generator[(str, List[dict], List[Tuple[int, int]])]:
+		info(f'Opening {self.path} for reading...')
+		with pd.read_json('./data.1.json.gz', orient='record', lines=True, compression='infer', chunksize=500) as reader:
+			for chunk in reader:
+				for video_id, captions, sponsor_times in chunk.itertuples(index=False, name=None):
+					# Convert from tuples to dicts
+					captions = [Caption(start, end, text) for (text, start, end) in captions]
+					yield video_id, captions, sponsor_times
+		info(f'Closed {self.path}.')
 
 class LabelledCaptionsDataset(torch.utils.data.IterableDataset):
+	"""
+	An `IterableDataset` which labels and returns the captions from the source
+	dataset. Suitable for the training of a sequence labelling model.
 
-    def __init__(self, dataset: torch.utils.data.IterableDataset):
-        super().__init__()
-        self.dataset = dataset
+	Yields tuples of the form: `video_id, captions, sponsor_ranges`.
+	The list of captions is a list of `Caption` with an extra key `is_sponsor`
+	indicating whether the caption belongs to a sponsored segment in the video.
+	"""
 
-    def __iter__(self):
-        for video_id, captions, sponsor_times in self.dataset:
-            for caption in captions:
-                caption['is_sponsor'] = False
+	def __init__(self, dataset: torch.utils.data.IterableDataset):
+		super().__init__()
+		self.dataset = dataset
 
-            drop_row = False
+	def __iter__(self):
+		for video_id, captions, sponsor_times in self.dataset:
+			for caption in captions:
+				caption['is_sponsor'] = False
 
-            sponsor_ranges = []
+			drop_row = False
 
-            for start_time, end_time in sponsor_times:
-                # get intersection range and extract the sponsor text from it
-                start_index, end_index = get_intersection_range(captions, start_time, end_time)
-                if start_index is None or end_index is None:
-                    print(f'Dropping {video_id} because sponsor times do not match the captions')
-                    drop_row = True
-                    break
+			sponsor_ranges = []
 
-                # mark range as sponsor
-                for i in range(start_index, end_index):
-                    captions[i]['is_sponsor'] = True
+			for start_time, end_time in sponsor_times:
+				# get intersection range and extract the sponsor text from it
+				start_index, end_index = get_intersection_range(captions, start_time, end_time)
+				if start_index is None or end_index is None:
+					print(f'Dropping {video_id} because sponsor times do not match the captions')
+					drop_row = True
+					break
 
-                sponsor_ranges.append([start_index, end_index])
+				# mark range as sponsor
+				for i in range(start_index, end_index):
+					captions[i]['is_sponsor'] = True
 
-            if not drop_row:
-                yield video_id, captions, sponsor_ranges
+				sponsor_ranges.append([start_index, end_index])
+
+			if len(sponsor_ranges) == 0:
+				drop_row = True
+
+			if not drop_row:
+				yield video_id, captions, sponsor_ranges
 
 class LabelledExamplesDataset(torch.utils.data.IterableDataset):
+	"""
+	An `IterableDataset` which samples the video transcripts and yields
+	examples of the classes `sponsor` or `content`. Due to how the sampling is
+	done, the dataset is always balanced in terms of class labels and sequence
+	lengths from both classes.
 
-    def __init__(self, dataset: torch.utils.data.IterableDataset):
-        super().__init__()
-        self.dataset = dataset
+	Yields tuples of the form: `text, label`.
 
-    def __iter__(self):
-        for video_id, captions, sponsor_times in self.dataset:
-            captions = list(tokenize_caption_list(captions))
-            segment_ranges = [get_intersection_range(captions, start_time - MAX_DURATION_PER_TOKEN, end_time + MAX_DURATION_PER_TOKEN, error=MAX_DURATION_PER_TOKEN) for start_time, end_time in sponsor_times]
-            # Filter out broken ranges
-            segment_ranges = [r for r in segment_ranges if r[0] is not None and r[1] is not None]
+	See also: `extract_labelled_data`
+	"""
 
-            for text, label in extract_labelled_data(video_id, captions, segment_ranges):
-                if len(text) == 0:
-                    continue
-                yield text, label
+	def __init__(self, dataset: torch.utils.data.IterableDataset):
+		super().__init__()
+		self.dataset = dataset
+
+	def __iter__(self):
+		for video_id, captions, sponsor_times in self.dataset:
+			captions = list(tokenize_caption_list(captions))
+			segment_ranges = [get_intersection_range(captions, start_time - MAX_DURATION_PER_TOKEN, end_time + MAX_DURATION_PER_TOKEN, error=MAX_DURATION_PER_TOKEN) for start_time, end_time in sponsor_times]
+			# Filter out broken ranges
+			segment_ranges = [r for r in segment_ranges if r[0] is not None and r[1] is not None]
+
+			for text, label in extract_labelled_data(video_id, captions, segment_ranges):
+				if len(text) == 0:
+					continue
+				yield text, label
 
 def load_data_from_chunks(base_name: str, root_dir: str = '.', chunks: Optional[Iterable[int]] = None):
-    """
-    Loads all `data.N.csv.gz` files.
-    """
-    if chunks is None:
-        files = glob(os.path.join(root_dir, f'{base_name}.*.json.gz'))
-    else:
-        files = [os.path.join(root_dir, f'{base_name}.{chunk}.json.gz') for chunk in chunks]
+	"""
+	Loads all `data.N.csv.gz` files.
+	"""
+	if chunks is None:
+		files = glob(os.path.join(root_dir, f'{base_name}.*.json.gz'))
+	else:
+		files = [os.path.join(root_dir, f'{base_name}.{chunk}.json.gz') for chunk in chunks]
 
-    if len(files) == 0:
-        raise Exception('No matching files found!')
+	if len(files) == 0:
+		raise Exception('No matching files found!')
 
-    for file in files:
-        if not os.path.exists(file):
-            raise FileNotFoundError(file)
-        info(f'Found {file}.')
+	for file in files:
+		if not os.path.exists(file):
+			raise FileNotFoundError(file)
+		info(f'Found {file}.')
 
-    return torch.utils.data.ChainDataset([GzippedJSONDataset(file) for file in files])
+	return torch.utils.data.ChainDataset([GzippedJSONDataset(file) for file in files])
 
 def load_captions_from_chunks(base_name: str, root_dir: str = '.', chunks: Optional[Iterable[int]] = None):
-    """
-    Loads all `data.N.csv.gz` files and labels the individual captions.
-    """
+	"""
+	Loads all `data.N.csv.gz` files and labels the individual captions.
 
-    return LabelledCaptionsDataset(load_data_from_chunks(base_name, root_dir, chunks))
+	See also: `LabelledCaptionsDataset`
+	"""
+
+	return LabelledCaptionsDataset(load_data_from_chunks(base_name, root_dir, chunks))
 
 def load_examples_from_chunks(base_name: str, root_dir: str = '.', chunks: Optional[Iterable[int]] = None):
-    """
-    Loads all `data.N.csv.gz` files and produces labelled examples.
-    """
+	"""
+	Loads all `data.N.csv.gz` files and produces labelled examples.
 
-    return LabelledExamplesDataset(load_data_from_chunks(base_name, root_dir, chunks))
+	See also: `LabelledExamplesDataset`
+	"""
+
+	return LabelledExamplesDataset(load_data_from_chunks(base_name, root_dir, chunks))
