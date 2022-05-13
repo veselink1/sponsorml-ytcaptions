@@ -3,6 +3,7 @@ from glob import glob
 import os
 import random
 
+from numpy import isin
 import pandas as pd
 import torch
 
@@ -249,7 +250,7 @@ class GzippedJSONDataset(torch.utils.data.IterableDataset):
 	"""
 	Reads a .json.gz file.
 	"""
-	def __init__(self, path: str):
+	def __init__(self, path: str, subset_length: int = None):
 		super().__init__()
 		self.path = path
 
@@ -258,6 +259,9 @@ class GzippedJSONDataset(torch.utils.data.IterableDataset):
 		with pd.read_json(self.path, orient='record', lines=True, compression='infer', chunksize=500) as reader:
 			for chunk in reader:
 				for video_id, captions, sponsor_times in chunk.itertuples(index=False, name=None):
+					if self.subset_length and self.subset_length < count:
+						break
+					count += 1
 					# Convert from tuples to dicts
 					captions = [Caption(start, end, text) for (text, start, end) in captions]
 					yield video_id, captions, sponsor_times
