@@ -1,9 +1,11 @@
 import os
+import re
 import sys
 from time import time
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterable, Iterator, List, Optional, Tuple
 from enum import Enum
 from datetime import timedelta
+import random
 
 import pandas as pd
 import webvtt # webvtt-py
@@ -67,20 +69,20 @@ def get_caption_list_from_path(path: str):
 	prev_cap = Caption(start=0, end=0, text="")
 	for cap in cap_iter:
 		cap = Caption(cap.start_in_seconds, cap.end_in_seconds, cap.text)
-		cap.text = cap.text.strip()
+		cap.text = clean_text(cap.text)
 
 		if cap.text == '':
 			continue
 
 		ilen = get_intersection_length(prev_cap.text, cap.text)
 		# Is the overlap a whole token or more?
-		if ilen >= len(cap.text.split(' ', 1)[0]):
+		if ilen > 0 and ilen >= len(cap.text.split(' ', 1)[0]):
 			if len(cap.text) == ilen:
 				# Remove the whole caption altogether, it is duplicated
 				continue
 			else:
-				# Remove the overlap from the previous caption
-				prev_cap.text = prev_cap.text[:-ilen]
+				# Remove the overlap from this caption
+				cap.text = cap.text[ilen:]
 
 		output.append(cap)
 		prev_cap = cap
@@ -94,7 +96,7 @@ def get_intersection_length(left: str, right: str):
 	```
 	left  = "except the various"
 	right =            "various forms"
-	                    ^^^^^^^
+						^^^^^^^
 	```
 	"""
 	i = 0
@@ -104,13 +106,14 @@ def get_intersection_length(left: str, right: str):
 	assert ilen == 0 or left[-ilen:] == right[:ilen]
 	return ilen
 
-def tokenize(text: str) -> List[str]:
-	# basic tokenization
-	return text.split(' ')
-
 def clean_text(text: str) -> str:
-	# no cleaning yet
-	return text
+	# Clean italicised quotes
+	text = text.replace('\u2019', '\'')
+	# Clean HTML and ASCII whitespace
+	text = re.sub(r"&nbsp;|\s+", " ", text, flags=re.MULTILINE)
+	# Remove markers like [Music], (Intro), special ... and emphasis (*) characters
+	text = re.sub(r"\[.+?\]|\(.+?\)|\u2026\*", "", text)
+	return text.strip()
 
 def build_segment_groups(segments: List[DBSegment]) -> List[OverlappingSegmentGroup]:
 	"""
@@ -165,10 +168,10 @@ def prepare_data(captions_path: str, sponsorml_path: str, output_path: str, vote
 		nonlocal chunk_id
 		nonlocal rows
 		chunk_id += 1
-		df = pd.DataFrame(rows, columns=['videoID', 'captions', 'sponsor_times'])
+		df = pd.DataFrame(rows, columns=['video_id', 'captions', 'sponsor_times'])
 		filename, ext = output_path.rsplit('.json', 1)
 		chunk_filename = f'{filename}.{chunk_id}.json{ext}'
-		df.to_json(chunk_filename, orient='records', compression='infer')
+		df.to_json(chunk_filename, compression='infer', orient='records', lines=True)
 		rows = []
 
 	# This is much much faster than doing sponsorml_df[sponsorml_df.videoID == videoID]
@@ -208,7 +211,8 @@ def prepare_data(captions_path: str, sponsorml_path: str, output_path: str, vote
 
 		segment_times = [(segment.startTime, segment.endTime) for segment in segments]
 
-		rows.append((videoID, captions, segment_times))
+		captions_as_tuples = [(cap.text, cap.start, cap.end) for cap in captions]
+		rows.append((videoID, captions_as_tuples, segment_times))
 
 		if len(rows) > chunk_size:
 			write_chunk()
@@ -222,8 +226,8 @@ def get_or_default(arr, i, default):
 CAPTIONS_PATH = get_or_default(sys.argv, 1, 'captions')
 SPONSORML_PATH = get_or_default(sys.argv, 2, 'sponsorTimes.csv')
 OUTPUT_PATH = get_or_default(sys.argv, 3, 'data.json.gz')
-VOTE_THRESHOLD = -1 # Same threshold SponsorBlock is using
-CHUNK_SIZE = 10_000
+VOTE_THRESHOLD = 1 # Higher threshold than minimum (-1) for SponsorBlock
+CHUNK_SIZE = 20_000
 
 def main():
 	prepare_data(CAPTIONS_PATH, SPONSORML_PATH, OUTPUT_PATH, VOTE_THRESHOLD, CHUNK_SIZE)
