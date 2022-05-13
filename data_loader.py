@@ -253,9 +253,11 @@ class GzippedJSONDataset(torch.utils.data.IterableDataset):
 	def __init__(self, path: str, subset_length: int = None):
 		super().__init__()
 		self.path = path
+		self.subset_length = subset_length
 
 	def __iter__(self) -> Generator[(str, List[dict], List[Tuple[int, int]])]:
 		info(f'Opening {self.path} for reading...')
+		count = 0
 		with pd.read_json(self.path, orient='record', lines=True, compression='infer', chunksize=500) as reader:
 			for chunk in reader:
 				for video_id, captions, sponsor_times in chunk.itertuples(index=False, name=None):
@@ -338,6 +340,96 @@ class LabelledExamplesDataset(torch.utils.data.IterableDataset):
 					continue
 				yield text, label
 
+class LabelledTokensDataset(torch.utils.data.IterableDataset):
+	"""
+	IterableDataset that tokenizes the transcripts of a given caption dataset
+	and labels the tokens according to whether they are included in a sponsor-labeled caption.
+	"""
+
+	def __init__(self, dataset, tokenizer):
+		super().__init__()
+		self.dataset = dataset
+		self.tokenizer = tokenizer
+
+	def __iter__(self):
+		for video_id, captions, sponsor_times in self.dataset:
+
+			drop_row = False
+
+			sponsor_ranges = []
+
+			for start_time, end_time in sponsor_times:
+				# get intersection range and extract the sponsor text from it
+				start_index, end_index = get_intersection_range(captions, start_time, end_time)
+				if start_index is None or end_index is None:
+					print(f'Dropping {video_id} because sponsor times do not match the captions')
+					drop_row = True
+					break
+
+				# mark range as sponsor
+				for i in range(start_index, end_index):
+					captions[i]['is_sponsor'] = True
+
+				sponsor_ranges.append([start_index, end_index])
+
+			if not drop_row:
+				input_ids = []
+				labels = []
+
+				for caption in captions:
+					tokenized_caption = self.tokenizer(caption['text'])
+					# remove special beginning/end tokens
+					input_ids += tokenized_caption['input_ids'][1:-1]
+
+					# label every token accordingly
+					label = 1 if 'is_sponsor' in caption else 0
+					labels += [label] * len(tokenized_caption['input_ids'][1:-1])
+
+				# flag indicating whether a completely non-sponsor segment has been yielded.
+				# limitting the number of fully non-sponsor segments to balance the data
+				yielded_non_sponsor = False
+
+				# go through the transcript max_length segment by max_length segment
+				for window_start in range(0, len(input_ids), 510):
+					w_input_ids = input_ids[window_start:]
+					w_labels = labels[window_start:]
+
+					# make sure to yield at most 1 completely non-sponsor segment
+					if 1 not in w_labels:
+						if yielded_non_sponsor:
+							continue
+						else:
+							yielded_non_sponsor = True
+
+					# add back special tokens
+					prepared_tokenizer = self.tokenizer.prepare_for_model(w_input_ids, truncation=True, padding='max_length')
+
+					attention_mask = prepared_tokenizer['attention_mask']
+
+					# loop to deal with special tokens, labelling them with -100 for the BERT model to ignore
+					new_labels = []
+					for i, m in enumerate(attention_mask):
+						if m == 1:
+							if i == 0:
+								new_labels.append(-100)
+							elif i == len(attention_mask) - 1:
+								new_labels.append(-100)
+							elif i == len(w_input_ids) + 1:
+								new_labels.append(-100)
+							else:
+								new_labels.append(w_labels[i-1])
+						else:
+							new_labels.append(-100)
+
+					w_input_ids = prepared_tokenizer['input_ids']
+
+					yield {'input_ids': w_input_ids, 'labels': new_labels, 'attention_mask': attention_mask}
+
+	def __len__(self):
+		# needed for training, 20001 is the length of every chunk in the caption dataset
+		return 20001
+
+
 def load_data_from_chunks(base_name: str, root_dir: str = '.', chunks: Optional[Iterable[int]] = None):
 	"""
 	Loads all `data.N.csv.gz` files.
@@ -353,7 +445,6 @@ def load_data_from_chunks(base_name: str, root_dir: str = '.', chunks: Optional[
 	for file in files:
 		if not os.path.exists(file):
 			raise FileNotFoundError(file)
-		info(f'Found {file}.')
 
 	return torch.utils.data.ChainDataset([GzippedJSONDataset(file) for file in files])
 
