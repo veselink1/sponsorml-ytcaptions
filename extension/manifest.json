@@ -1,0 +1,43 @@
+{
+	"name": "SkipSponsor: AI-powered sponsor detection",
+	"description": "Detect and skip YouTube™ sponsor segments using AI.",
+	"version": "1.0.0",
+	"manifest_version": 3,
+	"background": {
+		"service_worker": "background.js"
+	},
+	"content_scripts": [
+		{
+			"matches": [
+				"*://www.youtube.com/watch*"
+			],
+			"css": [
+				"stylesheet.css"
+			],
+			"js": [
+				"contentScript.js"
+			]
+		}
+	],
+	"permissions": [
+		"tabs"
+	],
+	"web_accessible_resources": [
+		{
+			"resources": [
+				"playerScript.js"
+			],
+			"matches": [
+				"<all_urls>"
+			]
+		}
+	],
+	"icons": {
+		"128": "icons/icon128.png",
+		"48": "icons/icon48.png"
+	},
+	"action": {
+		"default_title": "SkipSponsor",
+		"default_popup": "popup.html"
+	}
+}

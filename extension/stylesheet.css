@@ -1,0 +1,43 @@
+
+#sponsor-popup {
+	display: none;
+	position: absolute;
+    z-index: 100;
+    bottom: 20%;
+    font-size: x-large;
+    right: 5%;
+}
+
+#skip-sponsor-btn {
+	cursor: pointer;
+	background-color: #FFE900;
+	opacity: 0.7;
+	padding: 5px;
+	font-size: large;
+	color: black;
+	border-radius: 25px;
+	padding: 10px;
+	box-shadow: 0px 2px black;
+}
+
+#close-sponsor-popup-btn {
+    cursor: pointer;
+    position: absolute;
+    color: #060605;
+    background: #FCFFF7;
+    opacity: 0.8;
+    border-radius: 100%;
+    margin: 5px;
+    top: -14px;
+    right: -14px;
+    padding: 5px;
+    font-size: small;
+}
+
+#skip-sponsor-btn:hover {
+	opacity: 1;	
+}
+
+#close-sponsor-popup-btn:hover {
+	opacity: 1;	
+}
